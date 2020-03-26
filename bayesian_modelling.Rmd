@@ -1,0 +1,147 @@
+---
+title: "Bayesian estimation of COVID-19 epidemic"
+output: html_notebook
+---
+
+
+# Theory
+
+We define as key quantity
+
+* $I_t$, the _true_ number of new infections at day $t$.
+
+The two key observed quantities are
+
+* $c_t$, the _reported_ number of new cases at day $t$, and
+* $d_t$, the reported number of new deaths at day $t$.
+
+The key parameters are, together with prior information are:
+
+| Parameter     | Description                      | Prior     |
+|---------------|----------------------------------|-----------|
+| $\alpha$      | Exp. growth rate                 | U(1/30,1) |
+| $\gamma$      | Prob. to get tested              | U (0,1)   |
+| $\delta$      | Prob. to die if infected         | U(0,0.02) |
+| $\tau_t$      | Time from infection to  test     | 8         |
+| $\tau_\delta$ | Time from infection to death     | 17        |
+
+Explanations:
+
+* For the growth rate we assume anything between a doubling time of 30 days and 1 day as prior.
+* For the probability to be tested we don't assume anything.
+* For the probability to die we assume anything from 0 to 2\%.
+* For $\tau_\delta$ and $\tau_t$, for now we assume fixed numbers as given. We can later find more complex models, for example, where $\tau_\delta$ and $\tau_t$ are themselves distributions with hyperparameters to be estimated. For now, we'll just assume fixed lags and see what happens. 
+
+We can now write down simple Binomial sampling probabilities as generative models for $c_t$ and $d_t$, based on the unknown $I_t$:
+
+$$
+  \begin{split}
+  c_t &\sim \text{Bin}(c_t; I_{t-\tau_t}, \gamma)\\
+  d_t &\sim \text{Bin}(d_t; I_{t-\tau_\delta}, \delta)
+  \end{split}
+$$
+
+So we can write down a likelihood of the data given the model simply as the product of all these binomial probabilities across all time points where possible. So:
+
+$$
+  \mathcal{L} = \prod_t \text{Bin}(c_t; I_{t-\tau_t}, \gamma) \prod_t\text{Bin}(d_t; I_{t-\tau_\delta}, \delta) 
+$$
+where the products run over all days for which we have know $c_t$ or $d_t$, respectively.
+
+We can make one more reduction of parameters. Instead of estimate $I$ at every day separately, we can assume an exponential growth model with rate $\alpha$, as introduced above and the number of infected people $I_{t=0}$ at some defined day $t=0$. With this we can further simplify:
+
+$$
+  I_t = I_0 \exp(\alpha t)
+$$
+and so have for our full log-likelihood of the data given the model parameters:
+
+$$
+  \log\mathcal{L}(c_t,d_t|I_0,\alpha,\gamma,\delta,\tau_\delta,\tau_t) =
+  \sum_t \log \text{Bin}(c_t; I_0e^{\alpha(t-\tau_t)}, \gamma) +\sum_t \log \text{Bin}(d_t; I_0 e^{\alpha(t-\tau_\delta)}, \delta) 
+$$
+
+This then allows us to compute posterior distributions of all parameters using Monte Carlo sampling, as for example implemented in the package [RStan](https://mc-stan.org/rstan/).
+
+
+
+# Analysis
+
+Let's load some libraries
+```{r init}
+library(magrittr)
+library(ggplot2)
+```
+
+OK, we ran this likelihood model with the given priors with [STAN]() (more precisely, the [CmdStan]() interface) and obtained samples from the posterior, which can be loaded as a table:
+```{r loading, message=FALSE}
+stan_output <- readr::read_csv("output.csv", comment = "#")
+```
+
+Let's first just look at marginal summary statistics for each parameter
+```{r stan summary}
+stan_output %>%
+  tidyr::pivot_longer(c('alpha', 'gamma', 'delta', 'I0'),
+                      names_to = "param",
+                      values_to = "value") %>%
+  dplyr::group_by(param) %>%
+  dplyr::summarise(perc5 = quantile(value, 0.05),
+                   perc50_median = median(value),
+                   perc95 = quantile(value, 0.95))
+```
+
+More or less, these parameter estimates make somewhat sense. But there are some headscratchers. For example, the death rate $\delta$ is very low, and at the same time also the test detection rate $\gamma$ seems very low. We can gain some more clues by looking at the sampled posterior distributions for the four parameters and their correlations:
+```{r message=FALSE}
+stan_output %>%
+  dplyr::select(alpha, delta, I0, gamma) %>%
+  GGally::ggpairs()
+```
+
+So this now reveals an extremely tight correlation bewteen $\gamma$ and $\delta$ (0.98). It makes sense that in order to match the death counts you can increase the test coverage, thereby _decreasing_ the true nr of infected people (i.e. lowering the "Dunkelziffer"), and thereby increasing the death rate. So that might explain why both of these parameters together are poorly estimated, jointly. Not sure what to do about that.
+
+## Visualising the model
+
+So we can use the many samples from our posterior to check some predictions. First, here is a graph showing the "true" cases vs. the observed ones:
+
+```{r true cases model check}
+day_tbl <- tibble::tibble(days = 1:80) %>%
+  dplyr::mutate(date = as.POSIXct("2020-01-24") + lubridate::days(days))
+plot_curves <- stan_output %>%
+  dplyr::select(alpha, gamma, delta, I0) %>%
+  dplyr::mutate(id=1:nrow(stan_output)) %>%
+  tidyr::expand_grid(day_tbl)
+dplyr::mutate(plot_curves, true_cases = I0 * exp(days * alpha)) %>%
+  ggplot() +
+  geom_line(mapping = aes(x = date, y = true_cases, group = id), alpha=0.02) +
+  geom_point(rki_dat, mapping = aes(x = Meldedatum, y = AnzahlFall)) +
+  scale_y_log10() 
+```
+
+As expected, that's quite a bit higher than the observed ones, both due to the lag in testing (which here is fixed at 8 days) and due to unobserved cases.
+
+Then, here are the number of tested cases predicted from the model:
+
+```{r observed cases and model prediction}
+dplyr::mutate(plot_curves, predicted_testcases = I0 * exp((days - 8) * alpha) * gamma) %>%
+  ggplot() +
+  geom_line(mapping = aes(x = date, y = predicted_testcases, group = id), alpha=0.02) +
+  geom_point(rki_dat, mapping = aes(x = Meldedatum, y = AnzahlFall)) +
+  scale_y_log10()
+```
+
+and finally, the predicted deaths:
+
+```{r predicted deaths}
+dplyr::mutate(plot_curves, predicted_deaths = I0 * exp((days - 17) * alpha) * delta) %>%
+  ggplot() +
+  geom_line(mapping = aes(x = date, y = predicted_deaths, group = id), alpha=0.02) +
+  geom_point(rki_dat, mapping = aes(x = Meldedatum, y = AnzahlTodesfall)) +
+  scale_y_log10() 
+
+```
+
+# Discussion
+
+First, I think it's nice to see that this problem is tractable for a full Bayesian approach. Second, I think it's nice that it seems there is a systematic way to extract information from all the numbers, including deaths and cases, not just one of them separately.
+
+However, these analyses also show that the simple exponential model is insufficient. There are certainly rate changes, visible both in the tested cases and in the death cases. It would be nice to amend the model to be more "free"... perhaps some kind of hierarchical model that puts some constraint on the increase of infections, but allows for changes. Not trivial.
+
